@@ -1,0 +1,138 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - build
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y imagemagick jq unzip curl
+
+      - name: Install Gradle
+        run: |
+          curl -s "https://get.sdkman.io" | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install gradle 8.9
+          sdk use gradle 8.9
+          gradle --version
+
+      - name: Read build config
+        id: config
+        run: |
+          if [ -f build-config.json ]; then
+            echo "type=$(jq -r .type build-config.json)" >> $GITHUB_ENV
+            echo "url=$(jq -r .url build-config.json)" >> $GITHUB_ENV
+            echo "app_name=$(jq -r .app_name build-config.json)" >> $GITHUB_ENV
+            echo "build_type=$(jq -r .build_type build-config.json)" >> $GITHUB_ENV
+          else
+            echo "type=unknown" >> $GITHUB_ENV
+          fi
+
+      - name: Generate keystore
+        run: |
+          keytool -genkey -v -keystore release.keystore -alias release -keyalg RSA -keysize 2048 -validity 10000 -storepass password -keypass password -dname "CN=BuildBot, OU=Dev, O=BuildBot, L=City, S=State, C=ID"
+
+      # ===== WEB2APK =====
+      - name: Web2APK - Build
+        if: env.type == 'web2apk'
+        run: |
+          mkdir -p project/app/src/main/java/com/web2apk/app
+          mkdir -p project/app/src/main/res/layout
+          mkdir -p project/app/src/main/res/values
+          cd project
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          gradle assembleRelease || echo "Web2APK build skipped"
+
+      - name: Web2APK - Sign
+        if: env.type == 'web2apk'
+        run: |
+          APK_PATH=$(find project/app/build/outputs/apk/release -name "*.apk" 2>/dev/null | head -n 1)
+          if [ -f "$APK_PATH" ]; then
+            $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)/apksigner sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK_PATH" || true
+          fi
+
+      # ===== FLUTTER =====
+      - name: Prepare Flutter project
+        if: env.type == 'flutter'
+        run: |
+          rm -rf flutter-project
+          mkdir -p flutter-project
+          unzip -q flutter-project.zip -d flutter-project 2>/dev/null || true
+          
+          FIRST_DIR=$(find flutter-project -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
+          if [ -n "$FIRST_DIR" ] && [ -f "$FIRST_DIR/pubspec.yaml" ]; then
+            TMP_DIR=$(mktemp -d)
+            cp -R "$FIRST_DIR"/. "$TMP_DIR"/ 2>/dev/null || true
+            rm -rf flutter-project
+            mkdir -p flutter-project
+            cp -R "$TMP_DIR"/. flutter-project/ 2>/dev/null || true
+          fi
+          
+          if [ ! -f flutter-project/pubspec.yaml ]; then
+            echo "pubspec.yaml tidak ditemukan"
+            exit 1
+          fi
+
+      - name: Setup Flutter
+        if: env.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.22.0'
+          channel: 'stable'
+
+      - name: Build Flutter APK
+        if: env.type == 'flutter'
+        run: |
+          cd flutter-project
+          flutter clean
+          flutter pub get || true
+          
+          if [ "${{ env.build_type }}" = "release" ]; then
+            flutter build apk --release || exit 1
+          else
+            flutter build apk --debug || exit 1
+          fi
+
+      - name: Sign Flutter APK
+        if: env.type == 'flutter' && env.build_type == 'release'
+        run: |
+          APK_PATH=$(find flutter-project/build/app/outputs/flutter-apk -name "*.apk" 2>/dev/null | head -n 1)
+          if [ -f "$APK_PATH" ]; then
+            $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | sort -V | tail -n1)/apksigner sign --ks release.keystore --ks-pass pass:password --key-pass pass:password "$APK_PATH" || true
+          fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: |
+            project/app/build/outputs/apk/release/*.apk
+            flutter-project/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: warn
+
+      - name: Debug - List files
+        if: always()
+        run: |
+          echo "=== MENCARI APK ==="
+          find . -name "*.apk" 2>/dev/null || echo "Tidak ada APK ditemukan"
+          echo "=== SELESAI ==="
